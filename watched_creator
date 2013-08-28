@@ -1,0 +1,148 @@
+#!/bin/sh
+# (c) Peter C. Ndikuwera <pndiku@gmail.com>
+# A simple bash script to run on the PCH and update "WATCHED" status of video files.
+# Tries to use very simple scripting, so no python or perl - because these don't come 
+# standard on the NMT. Also, awk & sed aren't quite GNU-compatible, so things like in-place
+# editing don't work!
+
+. /share/Apps/local/etc/watched_creator.conf
+
+DEBUG=1
+if [ "$SHARE" == "" ]; then 
+    SHARE=/share
+fi
+if [ "$PIDFILE" == "" ]; then 
+    PIDFILE=/tmp/watched_creator.pid
+fi
+if [ "$JUKEBOX" == "" ]; then 
+    JUKEBOX=${SHARE}/Jukebox
+fi
+if [ "$WATCHEDPATH" == "" ]; then 
+    WATCHEDPATH=/share/Jukebox/watched
+fi
+if [ "$NMTPATHS" == "" ]; then 
+    NMTPATHS=/opt/sybhttpd/localhost.drives/NETWORK_SHARE/share1=/
+fi
+if [ "$INTERVAL" == "" ]; then 
+    INTERVAL=120
+fi
+if [ "$THRESHOLD" == "" ]; then 
+    THRESHOLD=85
+fi
+if [ "$UPDATEXML" == "" ]; then 
+    UPDATEXML=1
+fi
+
+if [ "$LOGFILE" == "" ]; then 
+    LOGFILE="/tmp/watched_creator.log"
+fi
+
+echo "NEW LOG" > $LOGFILE 
+function urlencode() {
+    OUT=$(python -c "import sys, urllib as ul; print ul.quote_plus(\"$1\")")
+    return $OUT
+}
+
+function log_line()
+{
+    L=$(date "+%Y-%m-%d %H:%M:%S")
+    L="$L $@"
+    if [ "$DEBUG" == "1" ]; then
+	echo $L >> $LOGFILE
+    else
+	echo $L
+    fi
+}
+
+function markWatched() 
+{
+    TMPWATCHED=/tmp/watched
+    basepath=$(basename "$1" | sed 's/\&amp;/\&/g')
+    log_line "MARKWATCHED: Filename => $basepath"
+
+    if ! [ -f "${WATCHEDPATH}/${basepath}.watched" ]; then
+    # Parse the different possible NMT Paths
+	gfilename="<fileLocation>.*/$basepath</fileLocation>"
+
+	log_line "MARKWATCHED: fileLocation => $gfilename"
+	
+	declare -a matches=()
+	
+	log_line "UPDATEXML=$UPDATEXML"
+	MYLINE=""
+	if [ "$UPDATEXML" == "1" ]; then
+	    # find files to check. This is faster than awk'ing through all the files. (I hope)
+	    FILES_TO_CHECK=$(grep -l "$gfilename" ${JUKEBOX}/Other_*.xml ${JUKEBOX}/Genres_*.xml ${JUKEBOX}/Certification_*.xml ${JUKEBOX}/Set_*.xml ${JUKEBOX}/Title_*xml ${JUKEBOX}/Year_*xml)
+
+	    log_line "files to check => $FILES_TO_CHECK"
+
+	    for i in ${FILES_TO_CHECK}; do
+		MYLINE=$(awk -v filename="$gfilename" '
+BEGIN {linenumber=0; matched=0; foundFile=0}
+/<file / {foundFile=1; }
+/watched=\"false\">/ && foundFile==1 { linenumber=NR; matched=1; foundFile=0 }
+match($0, filename) > 0 && matched == 1 { print linenumber; exit }
+' "$i")
+		
+		if [ "x$MYLINE" != "x" ] ; then 
+		    L="${i}:${MYLINE}"
+		    matches=("${matches[@]}" "$L")
+		fi
+		MYLINE=""
+	    done
+	    
+	    for line in "${matches[@]}"; do 
+		FNAME=$(echo $line | cut -d: -f1)
+		LINENUM=$(echo $line | cut -d: -f2)
+		
+		sed "${LINENUM}s/false/true/g" "$FNAME" > $TMPWATCHED
+		mv $TMPWATCHED "$FNAME"
+		log_line "Marked as WATCHED in file $FNAME [$LINENUM]"
+	    done
+	fi
+
+	log_line "Creating watched file for \"${basepath}\""
+	touch "${WATCHEDPATH}/${basepath}.watched"
+    else
+	log_line "Watched file already exists for \"${basepath}\""
+    fi
+}
+
+TMPFILE=/tmp/file
+checked=0
+oldFilename=""
+while /bin/true; do
+    # Main loop for checking progress of watched movie
+    wget -q -O - "http://127.0.0.1:8008/playback?arg0=get_current_vod_info" > $TMPFILE
+    if grep -q "<currentStatus>play</currentStatus>" $TMPFILE; then
+	currentlyPlaying=$(sed 's/.*<fullPath>\(.*\)<\/fullPath>.*/\1/g' $TMPFILE | sed "s/&apos;/'/g" | sed 's/&quot;/"/g' )
+
+	currentTime=$(sed 's/.*<currentTime>\(.*\)<\/currentTime>.*/\1/g' $TMPFILE)
+	totalTime=$(sed 's/.*<totalTime>\(.*\)<\/totalTime>.*/\1/g' $TMPFILE)
+
+	if [ "$currentPlaying" != "$oldFilename" ]; then
+	    checked=0
+	fi
+
+	if [ "$currentTime" != "Unknown" -a "$totalTime" != "Unknown" ]; then
+	# Have we already checked this file?
+	    currentTime=$((currentTime*100))
+	    percentage=$((currentTime/totalTime))
+	    
+	else
+	    percentage=0
+	fi
+
+	log_line "Currently playing @ ${percentage}%, ${checked}: $currentlyPlaying"
+
+	if [ $percentage -gt $THRESHOLD ] ; then
+	    if [ "x$checked" == "x0" ]; then
+		checked=1
+		oldFilename=$currentlyPlaying
+		markWatched "$oldFilename"
+	    fi
+	fi
+
+    fi
+    sleep $INTERVAL
+done
